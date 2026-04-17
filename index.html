@@ -142,10 +142,16 @@
         <i class="fas fa-comment-dots"></i>
         <span class="nav-label">Chat</span>
       </a>
-      <a class="nav-item" href="#" title="Search" id="navSearchToggle">
-        <i class="fas fa-search"></i>
-        <span class="nav-label">Search</span>
-      </a>
+      <div class="nav-item-search-wrap">
+        <a class="nav-item" href="#" title="Search" id="navSearchToggle">
+          <i class="fas fa-search"></i>
+          <span class="nav-label">Search</span>
+        </a>
+        <div id="searchSlideOut" class="search-slide-out">
+          <input type="text" id="globalSearchInput" placeholder="Search TMDb..." autocomplete="off">
+          <ul id="globalSearchResults" class="global-search-results"></ul>
+        </div>
+      </div>
     </div>
     <div class="nav-bottom">
       <a class="nav-item" href="#" id="themeToggleBtn" title="Toggle Theme">
@@ -168,6 +174,9 @@
        MAIN CONTENT
   ══════════════════════════════════════════════════════════════ -->
   <main class="main-content" id="mainContent">
+    <div id="ptrContainer" class="ptr-container">
+      <i class="fas fa-sync ptr-spinner"></i>
+    </div>
 
     <!-- ── MOBILE HEADER ── -->
     <header class="mobile-header">
@@ -205,23 +214,6 @@
       </div>
     </section>
 
-    <!-- ── STATUS COMPOSER ── -->
-    <div class="status-composer" id="statusComposer">
-      <img id="composerAvatar" src="" alt="You" class="composer-avatar">
-      <div class="composer-input-wrap">
-        <input
-          type="text"
-          id="movieName"
-          class="composer-input"
-          placeholder="What did you watch today?"
-          autocomplete="off"
-        >
-        <button class="composer-post-btn" onclick="submitMovie()">
-          <i class="fas fa-plus"></i>
-        </button>
-        <ul id="suggestionsList" class="suggestions-list"></ul>
-      </div>
-    </div>
 
     <!-- ══════════════════════════════════════════════════
          COMMUNITY SLIDER — Suggested for You
@@ -288,7 +280,7 @@
         <option value="title">A–Z Title</option>
       </select>
     </div>
-    <div class="panel-section panel-pills">
+    <div class="panel-section panel-pills user-centric-view">
       <label class="panel-label">View</label>
       <button id="myMoviesButton" class="pill-btn">My Movies</button>
       <button id="watchedMoviesButton" class="pill-btn">Watched</button>
@@ -573,11 +565,6 @@
   <!-- Toast -->
   <div id="toast" class="toast"></div>
 
-  <!-- Share FAB -->
-  <button class="share-fab" id="shareFab" title="Share App"
-          onclick="shareContent('Check out MovieStreak!', window.location.href)">
-    <i class="fas fa-share-nodes"></i>
-  </button>
 
   <!-- Firebase SDKs -->
   <script src="https://www.gstatic.com/firebasejs/9.6.10/firebase-app-compat.js"></script>
