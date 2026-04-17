@@ -33,6 +33,13 @@ let allMovies          = [];   // full Firebase dataset
 let movieUsers         = {};
 let currentStreakCount = 0;
 let movieDiscoveryPool = [];
+let blacklist          = { movies: new Set(), genres: new Set() };
+let algorithmTracking = {
+    searches: [],
+    playedGenres: {},
+    watchlistGenres: {},
+    watchedGenres: {}
+};
 let currentDiscoveryMovieKey = null;
 let tmdbSearchResults  = [];
 let currentEditKey     = null;
@@ -280,6 +287,28 @@ function applyFilters(movies) {
  * Injects genre sliders and inline reels at defined intervals.
  * Only uses personalized movie set.
  */
+let activePlayers = new Set();
+
+function onPlayerStateChange(event) {
+    if (event.data === YT.PlayerState.PLAYING) {
+        const currentPlayerId = event.target.getIframe().id;
+        activePlayers.forEach(player => {
+            if (player.getIframe().id !== currentPlayerId) {
+                player.pauseVideo();
+            }
+        });
+
+        // Track genre of played video
+        const movieKey = event.target.getIframe().dataset.movieKey;
+        if (movieKey) {
+            const movie = allMovies.find(m => m.key === movieKey);
+            if (movie && movie.genre) {
+                trackAlgorithmInteraction('play', { genres: movie.genre });
+            }
+        }
+    }
+}
+
 async function renderFeed() {
     const feed = document.getElementById('feedContainer');
     feed.innerHTML = '';
@@ -287,7 +316,19 @@ async function renderFeed() {
     const personal  = getPersonalizedMovies();
     const filtered  = applyFilters(personal);
 
-    if (filtered.length === 0) {
+    // Calculate genre commonalities for the algorithm
+    algorithmTracking.watchedGenres = {};
+    algorithmTracking.watchlistGenres = {};
+    allMovies.forEach(m => {
+        if (m.watchedBy && m.watchedBy[currentUserId] && m.genre) {
+            m.genre.split(', ').forEach(g => algorithmTracking.watchedGenres[g] = (algorithmTracking.watchedGenres[g] || 0) + 1);
+        }
+        if (m.wannaWatchBy && m.wannaWatchBy[currentUserId] && m.genre) {
+            m.genre.split(', ').forEach(g => algorithmTracking.watchlistGenres[g] = (algorithmTracking.watchlistGenres[g] || 0) + 1);
+        }
+    });
+
+    if (filtered.length === 0 && algorithmTracking.searches.length === 0) {
         feed.appendChild(buildEmptyState());
         return;
     }
@@ -295,9 +336,28 @@ async function renderFeed() {
     if (cachedReelPool.length === 0) prefetchReelPool(8);
 
     let reelQueue        = shuffleArray([...cachedReelPool]);
-    let genreQueue       = shuffleArray([...FEATURED_GENRES]);
+
+    // Sort genres by user interest
+    const interest = {};
+    Object.keys(tmdbGenreMap).forEach(g => {
+        interest[g] = (algorithmTracking.watchedGenres[g] || 0) * 2 +
+                     (algorithmTracking.watchlistGenres[g] || 0) * 1.5 +
+                     (algorithmTracking.playedGenres[g] || 0);
+    });
+    let genreQueue = Object.keys(interest).sort((a, b) => interest[b] - interest[a]);
+    if (genreQueue.length === 0 || interest[genreQueue[0]] === 0) genreQueue = shuffleArray([...FEATURED_GENRES]);
     let postIndex        = 0;
     let genreSliderCount = 0;
+
+    // Inject "Related Movies" into the feed based on top interest
+    if (genreQueue.length > 0 && interest[genreQueue[0]] > 0) {
+        const topGenre = genreQueue[0];
+        const relatedSection = await createFeedGenreSlider(topGenre);
+        if (relatedSection) {
+            relatedSection.querySelector('.feed-genre-sub').textContent = 'Based on your interests';
+            feed.appendChild(relatedSection);
+        }
+    }
 
     for (const movie of filtered) {
         // Fetch trailer for very first post only (rate limit friendly)
@@ -309,7 +369,8 @@ async function renderFeed() {
         // Decide if this video should be 9:16 IG format
         const useIgReel = youtubeId && Math.random() < IG_REEL_PROBABILITY;
         const card = createPostCard(movie, { youtubeId, useIgReel });
-        feed.appendChild(card);
+        if (card) feed.appendChild(card);
+        else continue;
         postIndex++;
 
         // ── Inject genre slider every N posts ──
@@ -325,7 +386,29 @@ async function renderFeed() {
             const reel = reelQueue.shift();
             feed.appendChild(createInlineFeedReel(reel.id, reel.title));
         }
+
+        // Randomly inject Quick Pick into the feed
+        if (postIndex % 5 === 0 && Math.random() < 0.3) {
+            const qpCard = createQuickPickFeedComponent();
+            feed.appendChild(qpCard);
+        }
     }
+}
+
+function createQuickPickFeedComponent() {
+    const card = document.createElement('div');
+    card.className = 'post-card quick-pick-feed-card';
+    card.style.padding = 'var(--sp-lg)';
+    card.style.textAlign = 'center';
+    card.style.background = 'var(--accent-dim)';
+    card.style.border = '2px dashed var(--accent)';
+    card.innerHTML = `
+        <i class="fas fa-bolt" style="font-size: 2rem; color: var(--accent); margin-bottom: var(--sp-md);"></i>
+        <h3 style="margin-bottom: var(--sp-sm);">Quick Pick</h3>
+        <p style="font-size: 0.9rem; margin-bottom: var(--sp-md);">Swipe through trending movies and find your next favorite!</p>
+        <button class="btn-primary" style="margin: 0 auto;" onclick="openSelectionSlide()">Start Swiping</button>
+    `;
+    return card;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -381,7 +464,7 @@ async function createFeedGenreSlider(genreName) {
             }
 
             const existing = allMovies.find(m => m.name === movie.title);
-            slider.appendChild(createSliderCard({
+            const card = createSliderCard({
                 name:           movie.title,
                 poster:         `${tmdbImageBase}${movie.poster_path}`,
                 genre:          genreName,
@@ -391,7 +474,8 @@ async function createFeedGenreSlider(genreName) {
                 likes:          existing ? existing.likes        : {},
                 watchedBy:      existing ? existing.watchedBy    : {},
                 wannaWatchBy:   existing ? existing.wannaWatchBy : {}
-            }));
+            });
+            if (card) slider.appendChild(card);
         });
 
         section.append(header, slider);
@@ -439,7 +523,7 @@ async function renderTopTrendingSlider() {
 
         movies.forEach(movie => {
             const existing = allMovies.find(m => m.name === movie.title);
-            slider.appendChild(createSliderCard({
+            const card = createSliderCard({
                 name: movie.title,
                 poster: `${tmdbImageBase}${movie.poster_path}`,
                 genre: '', tmdbId: movie.id,
@@ -448,7 +532,8 @@ async function renderTopTrendingSlider() {
                 likes:        existing ? existing.likes        : {},
                 watchedBy:    existing ? existing.watchedBy    : {},
                 wannaWatchBy: existing ? existing.wannaWatchBy : {}
-            }));
+            });
+            if (card) slider.appendChild(card);
         });
         section.style.display = 'block';
     } catch (e) {
@@ -480,7 +565,10 @@ function renderCommunitySlider() {
     suggestions = [...shuffleArray(top), ...shuffleArray(rest)].slice(0, 12);
 
     slider.innerHTML = '';
-    suggestions.forEach(m => slider.appendChild(createSliderCard(m)));
+    suggestions.forEach(m => {
+        const card = createSliderCard(m);
+        if (card) slider.appendChild(card);
+    });
     section.style.display = 'block';
 }
 
@@ -513,14 +601,15 @@ async function renderRandomDiscoverySlider() {
 
         movies.forEach(movie => {
             const existing = allMovies.find(m => m.name === movie.title);
-            slider.appendChild(createSliderCard({
+            const card = createSliderCard({
                 name: movie.title, poster: `${tmdbImageBase}${movie.poster_path}`,
                 genre: '', tmdbId: movie.id,
                 key: existing ? existing.key : null, isExternalTmdb: true,
                 likes:        existing ? existing.likes        : {},
                 watchedBy:    existing ? existing.watchedBy    : {},
                 wannaWatchBy: existing ? existing.wannaWatchBy : {}
-            }));
+            });
+            if (card) slider.appendChild(card);
         });
         section.style.display = 'block';
     } catch { section.style.display = 'none'; }
@@ -534,6 +623,9 @@ async function renderRandomDiscoverySlider() {
  * Compact slider card (2:3 poster)
  */
 function createSliderCard(movie) {
+    if (blacklist.movies.has(movie.name)) return null;
+    if (movie.genre && blacklist.genres.has(movie.genre.split(', ')[0])) return null;
+
     const isLiked      = !!(movie.likes && movie.likes[currentUserId]);
     const isWatched    = !!(movie.watchedBy && movie.watchedBy[currentUserId]);
     const isWannaWatch = !!(movie.wannaWatchBy && movie.wannaWatchBy[currentUserId]);
@@ -565,6 +657,17 @@ function createSliderCard(movie) {
     const actionsEl = document.createElement('div');
     actionsEl.className = 'slider-card-actions';
 
+    // Not Interested Button
+    const xBtn = document.createElement('div');
+    xBtn.className = 'not-interested-btn';
+    xBtn.innerHTML = '<i class="fas fa-times"></i>';
+    xBtn.title = 'Not Interested';
+    xBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        handleNotInterested(card, movie);
+    });
+    card.appendChild(xBtn);
+
     const likeI = document.createElement('i');
     likeI.className = `fas fa-heart${isLiked ? ' liked' : ''}`;
     likeI.title = 'Like';
@@ -581,7 +684,7 @@ function createSliderCard(movie) {
 
     card.addEventListener('click', () => {
         if (movie.key && !movie.isExternalTmdb) showMovieDetails(movie.key);
-        else if (movie.tmdbId) window.open(`https://www.themoviedb.org/movie/${movie.tmdbId}`, '_blank');
+        else if (movie.tmdbId) showMovieDetailsByTmdbId(movie.tmdbId);
     });
     return card;
 }
@@ -638,6 +741,9 @@ function createTallReelCard(youtubeId, title) {
  * @param {Object} opts  { youtubeId, useIgReel }
  */
 function createPostCard(movie, opts = {}) {
+    if (blacklist.movies.has(movie.name)) return null;
+    if (movie.genre && blacklist.genres.has(movie.genre.split(', ')[0])) return null;
+
     const { youtubeId = null, useIgReel = false } = opts;
 
     const isOwner      = movie.owner === currentUserId;
@@ -654,6 +760,17 @@ function createPostCard(movie, opts = {}) {
     const article = document.createElement('article');
     article.className = 'post-card';
     article.dataset.key = movie.key;
+
+    // Not Interested Button
+    const xBtn = document.createElement('div');
+    xBtn.className = 'not-interested-btn';
+    xBtn.innerHTML = '<i class="fas fa-times"></i>';
+    xBtn.title = 'Not Interested';
+    xBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        handleNotInterested(article, movie);
+    });
+    article.appendChild(xBtn);
 
     // ── Header ──
     const header = document.createElement('div');
@@ -687,14 +804,14 @@ function createPostCard(movie, opts = {}) {
     const media = document.createElement('div');
 
     if (youtubeId) {
+        const uniqueId = `player-${Math.random().toString(36).substr(2, 9)}`;
         if (useIgReel) {
             // Instagram 9:16 format
             media.className = 'post-media post-media-reel';
-            const iframe = document.createElement('iframe');
+            const iframe = document.createElement('div');
+            iframe.id = uniqueId;
             iframe.className = 'post-youtube-frame';
-            iframe.src = `https://www.youtube.com/embed/${youtubeId}?rel=0&modestbranding=1&enablejsapi=1`;
-            iframe.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture';
-            iframe.allowFullscreen = true; iframe.loading = 'lazy';
+            iframe.dataset.movieKey = movie.key;
             const badge = document.createElement('div');
             badge.className = 'post-reel-badge';
             badge.textContent = 'Reel';
@@ -702,13 +819,26 @@ function createPostCard(movie, opts = {}) {
         } else {
             // Standard 16:9 landscape
             media.className = 'post-media post-media-wide';
-            const iframe = document.createElement('iframe');
+            const iframe = document.createElement('div');
+            iframe.id = uniqueId;
             iframe.className = 'post-youtube-frame';
-            iframe.src = `https://www.youtube.com/embed/${youtubeId}?rel=0&modestbranding=1&enablejsapi=1`;
-            iframe.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture';
-            iframe.allowFullscreen = true; iframe.loading = 'lazy';
+            iframe.dataset.movieKey = movie.key;
             media.appendChild(iframe);
         }
+
+        // Initialize YT Player
+        setTimeout(() => {
+            if (youtubePlayerReady) {
+                const player = new YT.Player(uniqueId, {
+                    height: '100%',
+                    width: '100%',
+                    videoId: youtubeId,
+                    playerVars: { 'rel': 0, 'modestbranding': 1, 'enablejsapi': 1 },
+                    events: { 'onStateChange': onPlayerStateChange }
+                });
+                activePlayers.add(player);
+            }
+        }, 100);
     } else {
         media.className = 'post-media';
         media.addEventListener('click', () => showMovieDetails(movie.key));
@@ -1482,6 +1612,36 @@ function timeSince(date) {
 
 function escHtml(str) { const el = document.createElement('div'); el.appendChild(document.createTextNode(str || '')); return el.innerHTML; }
 
+function trackAlgorithmInteraction(type, data) {
+    if (type === 'search') {
+        algorithmTracking.searches.push(data.movieName);
+        if (data.genres) {
+            data.genres.split(', ').forEach(g => {
+                algorithmTracking.playedGenres[g] = (algorithmTracking.playedGenres[g] || 0) + 1;
+            });
+        }
+    } else if (type === 'play') {
+        if (data.genres) {
+            data.genres.split(', ').forEach(g => {
+                algorithmTracking.playedGenres[g] = (algorithmTracking.playedGenres[g] || 0) + 1;
+            });
+        }
+    }
+}
+
+function handleNotInterested(element, movie) {
+    element.classList.add('fade-out');
+    blacklist.movies.add(movie.name);
+    if (movie.genre) {
+        blacklist.genres.add(movie.genre.split(', ')[0]);
+    }
+    setTimeout(() => {
+        element.remove();
+        // Refresh sliders to ensure no more of this movie/genre shows up
+        renderDiscoverySliders();
+    }, 500);
+}
+
 // ════════════════════════════════════════════════════════════════
 // SECTION 25 — EVENT LISTENERS
 // ════════════════════════════════════════════════════════════════
@@ -1526,13 +1686,147 @@ document.getElementById('wannaWatchMoviesButton').addEventListener('click', (e) 
 document.getElementById('searchBox').addEventListener('input', (e) => { currentFilter.search = e.target.value; renderFeed(); });
 
 // Search toggle
-document.getElementById('navSearchToggle')?.addEventListener('click', (e) => { e.preventDefault(); document.getElementById('movieName').focus(); document.getElementById('statusComposer').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
-document.getElementById('mobileSearchToggle')?.addEventListener('click', () => { document.getElementById('movieName').focus(); document.getElementById('statusComposer').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+document.getElementById('navSearchToggle')?.addEventListener('click', (e) => {
+    e.preventDefault();
+    const slideOut = document.getElementById('searchSlideOut');
+    slideOut.classList.toggle('open');
+    if (slideOut.classList.contains('open')) {
+        document.getElementById('globalSearchInput').focus();
+    }
+});
+
+document.getElementById('mobileSearchToggle')?.addEventListener('click', () => {
+    const slideOut = document.getElementById('searchSlideOut');
+    slideOut.classList.toggle('open');
+    if (slideOut.classList.contains('open')) {
+        document.getElementById('globalSearchInput').focus();
+    }
+});
+
+const globalSearchInput = document.getElementById('globalSearchInput');
+const globalSearchResults = document.getElementById('globalSearchResults');
+let globalSearchTimeout;
+
+globalSearchInput.addEventListener('input', () => {
+    clearTimeout(globalSearchTimeout);
+    const q = globalSearchInput.value.trim();
+    if (q.length < 2) {
+        globalSearchResults.style.display = 'none';
+        return;
+    }
+    globalSearchTimeout = setTimeout(async () => {
+        try {
+            const res = await fetch(`${tmdbBaseUrl}/search/movie?api_key=${tmdbApiKey}&query=${encodeURIComponent(q)}`);
+            const data = await res.json();
+            displayGlobalSearchResults(data.results || []);
+        } catch (e) {}
+    }, 500);
+});
+
+function displayGlobalSearchResults(results) {
+    globalSearchResults.innerHTML = '';
+    if (!results.length) {
+        globalSearchResults.style.display = 'none';
+        return;
+    }
+
+    results.slice(0, 8).forEach(movie => {
+        const li = document.createElement('li');
+        const img = document.createElement('img');
+        img.src = movie.poster_path ? `${tmdbImageBase}${movie.poster_path}` : 'https://via.placeholder.com/32x48?text=N/A';
+        const span = document.createElement('span');
+        span.textContent = movie.title;
+        li.append(img, span);
+        li.addEventListener('click', () => {
+            showMovieDetailsByTmdbId(movie.id);
+            globalSearchResults.style.display = 'none';
+            globalSearchInput.value = '';
+            document.getElementById('searchSlideOut').classList.remove('open');
+        });
+        globalSearchResults.appendChild(li);
+    });
+    globalSearchResults.style.display = 'block';
+}
+
+async function showMovieDetailsByTmdbId(tmdbId) {
+    const details = await fetchMovieDetailsFromTMDb(tmdbId);
+    // Mimic the movie object structure used by showMovieDetails
+    const movie = {
+        name: details.name,
+        poster: details.poster,
+        plot: details.plot,
+        genre: details.genre,
+        actors: details.actors,
+        tmdbId: tmdbId
+    };
+
+    document.getElementById('detailTitle').textContent       = movie.name || '';
+    document.getElementById('detailPoster').src              = movie.poster || '';
+    document.getElementById('detailDescription').textContent = movie.plot || 'No description available.';
+    document.getElementById('detailGenre').textContent       = movie.genre || 'Unknown';
+    const castList = document.getElementById('castList');
+    const castSection = document.getElementById('castSection');
+    castList.innerHTML = '';
+    if (movie.actors && movie.actors.length > 0) {
+        castSection.style.display = 'block';
+        for (const actor of movie.actors) {
+            const url = await fetchActorProfile(actor);
+            const el = document.createElement('div'); el.className = 'cast-member';
+            el.innerHTML = `<img src="${url}" alt="${escHtml(actor)}" loading="lazy"><span>${escHtml(actor)}</span>`;
+            castList.appendChild(el);
+        }
+    } else castSection.style.display = 'none';
+    document.getElementById('movieDetailsModal').classList.add('visible');
+
+    // Track search interaction for the algorithm
+    trackAlgorithmInteraction('search', { movieName: movie.name, genres: movie.genre });
+}
 
 // Close suggestions on outside click
 window.addEventListener('click', (e) => {
     const sugg = document.getElementById('suggestionsList'); const input = document.getElementById('movieName');
     if (!sugg.contains(e.target) && !input.contains(e.target)) sugg.style.display = 'none';
+});
+
+// ════════════════════════════════════════════════════════════════
+// SECTION 25.1 — PULL TO REFRESH
+// ════════════════════════════════════════════════════════════════
+
+let ptrStartY = 0;
+let ptrCurrentY = 0;
+const ptrThreshold = 100;
+const ptrResistance = 0.4;
+const ptrContainer = document.getElementById('ptrContainer');
+
+window.addEventListener('touchstart', (e) => {
+    if (window.scrollY === 0) {
+        ptrStartY = e.touches[0].pageY;
+    }
+}, { passive: true });
+
+window.addEventListener('touchmove', (e) => {
+    if (ptrStartY === 0 || window.scrollY > 0) return;
+    ptrCurrentY = e.touches[0].pageY;
+    const diff = (ptrCurrentY - ptrStartY) * ptrResistance;
+    if (diff > 0) {
+        ptrContainer.style.height = `${Math.min(diff, ptrThreshold + 20)}px`;
+        if (diff >= ptrThreshold) {
+            ptrContainer.classList.add('active');
+        } else {
+            ptrContainer.classList.remove('active');
+        }
+    }
+}, { passive: true });
+
+window.addEventListener('touchend', () => {
+    if (ptrContainer.classList.contains('active')) {
+        ptrContainer.style.height = '60px';
+        location.reload(); // Simple refresh for native feel
+    } else {
+        ptrContainer.style.height = '0';
+    }
+    ptrStartY = 0;
+    ptrCurrentY = 0;
 });
 
 // ════════════════════════════════════════════════════════════════
@@ -1556,25 +1850,6 @@ window.addEventListener('DOMContentLoaded', () => {
         prefetchReelPool(4);
     }
 
-    // ── Mobile bottom nav (dynamically injected) ──
-    const bottomNav = document.createElement('nav');
-    bottomNav.className = 'mobile-bottom-nav';
-    bottomNav.innerHTML = `
-        <a href="#" class="active" title="Feed"><i class="fas fa-home"></i></a>
-        <a href="#" onclick="event.preventDefault(); startDiscoveryGame()" title="Discover"><i class="fas fa-compass"></i></a>
-        <a href="#" id="mobileComposerBtn" title="Post">
-            <i class="fas fa-plus-circle" style="font-size:1.5rem;color:var(--accent);"></i>
-        </a>
-        <a href="#" onclick="event.preventDefault(); openSelectionSlide()" title="Quick Pick"><i class="fas fa-bolt"></i></a>
-        <a href="reels.html" title="Reels"><i class="fas fa-play-circle"></i></a>
-    `;
-    document.body.appendChild(bottomNav);
-
-    document.getElementById('mobileComposerBtn')?.addEventListener('click', (e) => {
-        e.preventDefault();
-        document.getElementById('movieName').focus();
-        document.getElementById('statusComposer').scrollIntoView({ behavior: 'smooth', block: 'start' });
-    });
 
     // Responsive padding
     const updatePadding = () => {
